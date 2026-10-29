@@ -1,0 +1,235 @@
+*&---------------------------------------------------------------------*
+*& Modulpool         /VWK/EAI_DL_DISTRIBUTION
+*&
+*&---------------------------------------------------------------------*
+*&  17.09.2003      M. Freckmann
+*&  Verteilung der Verteilerliste : alle Einträge zu einem
+*&  Geschäftspartner werden jeweils verteilt.
+*&---------------------------------------------------------------------*
+
+INCLUDE /vwk/eai_bupa_dist_para_top.
+
+DATA: l_partner                   TYPE bu_partner,
+      l_partner_s                 TYPE string,
+      l_key                       TYPE /vwk/eai_jobcontrol_key,
+      ls_key                      TYPE /vwk/eai_jobcontrol_sel_key,
+      lo_bupa_dl_metastructure    TYPE REF TO /vwk/eai_cl_bupa_dl_metastruc,
+      ls_bupa_dist_list           TYPE /vwk/eai_dl_distribution_list,
+      lt_bupa_dist_lists          TYPE /vwk/eai_dls_distribution_msg,
+      ls_bupa_relations_msg       TYPE /vwk/eai_bupa_relations_msg,
+      lt_bupa_relations_ma_msg    TYPE /vwk/eai_bupa_relations_ma_msg,
+      l_dl_lines                  TYPE i,
+      l_key_lines                 TYPE i,
+      l_count                     TYPE i,
+      l_index                     TYPE sy-tabix,
+      l_rc                        TYPE sy-subrc,
+      l_dist(4)                   TYPE c,
+      l_para3                     TYPE string,
+      l_exceptionmode             TYPE /vwk/eai_exceptionmode,
+      l_target_system             TYPE /vwk/eai_system
+      .
+
+*==================================================================
+
+SELECT-OPTIONS so_key FOR l_key.
+PARAMETERS: pa_xi_ps TYPE i,
+            pa_param TYPE /vwk/eai_jobcontrol_parameter.
+
+SPLIT pa_param AT ';' INTO l_dist l_exceptionmode l_para3.
+
+* Parameter prüfen
+IF sy-subrc <> 0.
+  MESSAGE ID '/VWK/EAI_JOBCONTROL' TYPE 'E' NUMBER '007'.
+ENDIF.
+
+IF l_dist(2) <> 'DL'.
+  MESSAGE ID '/VWK/EAI_JOBCONTROL' TYPE 'E' NUMBER '007'.
+ENDIF.
+
+* Zielsystem ermitteln
+IF l_exceptionmode(7)        = 'Initial'.
+  l_target_system            = l_exceptionmode+7.
+ELSEIF l_exceptionmode(5)    = 'Delta'.
+  l_target_system            = l_exceptionmode+5.
+ENDIF.
+
+
+DESCRIBE TABLE so_key LINES l_key_lines.
+l_count = 0.
+
+CLEAR lt_bupa_dist_lists.
+
+LOOP AT so_key INTO ls_key.
+  l_index     = sy-tabix.
+  l_partner   = ls_key-low.
+
+* Aufbau der Metastruktur für Verteilerliste des Geschäftspartners
+  CREATE OBJECT lo_bupa_dl_metastructure.
+  l_partner_s = l_partner.
+  CALL METHOD lo_bupa_dl_metastructure->create_distribution_list
+    EXPORTING
+      im_business_partner_id    = l_partner_s
+      im_exceptionmode          = l_exceptionmode
+    IMPORTING
+      ex_bupa_distribution_list = ls_bupa_dist_list
+    EXCEPTIONS
+      fehler_bei_konvertierung  = 1
+      no_distributions          = 2.
+
+  CASE sy-subrc.
+
+    WHEN 0.
+* Veteilerliste an Gesamtliste anhängen
+      APPEND ls_bupa_dist_list-distribution_list_distribution
+          TO lt_bupa_dist_lists-distribution_lists-distribution_list.
+      CLEAR ls_bupa_dist_list.
+      l_count                     = l_count + 1.
+
+* Konvertierungsfehler Fehler
+    WHEN 1.
+      MESSAGE ID '/VWK/EAI_INTERFACES' TYPE 'I' NUMBER '4'
+        WITH l_partner.
+      PERFORM write_error_tab_msg
+              USING
+                 l_partner
+                 l_dist
+                 l_target_system
+                 '4'
+                 l_partner.
+
+* keine Verteilerlisteneinträge aufgebaut
+    WHEN 2.
+
+* kann nicht vorkommen
+    WHEN OTHERS.
+      MESSAGE ID '/VWK/EAI_INTERFACES' TYPE 'E' NUMBER '5'
+        WITH l_partner.
+      PERFORM write_error_tab_msg
+              USING
+                 l_partner
+                 l_dist
+                 l_target_system
+                 '5'
+                 l_partner.
+
+  ENDCASE.
+
+**********************************************************************
+*   Check if package size is reached or last Bupa.
+*   If ok send Package to XI.
+**********************************************************************
+  IF l_count >= pa_xi_ps OR l_index = l_key_lines.
+*   Send package Verteilerlisten
+    DESCRIBE TABLE lt_bupa_dist_lists-distribution_lists-distribution_list
+             LINES l_dl_lines.
+
+    IF l_dl_lines > 0.
+      TRY.
+          CALL METHOD /vwk/cl_eai_dl_wrapper_o_main=>dls_distribution_async_out
+            EXPORTING
+              output = lt_bupa_dist_lists.
+
+*         Verteilung ok
+          COMMIT WORK.
+          MESSAGE ID '/VWK/EAI_INTERFACES' TYPE 'I' NUMBER '8'
+              WITH l_dl_lines.
+
+        CATCH cx_ai_system_fault .
+*         Fehlerhafte Verteilung
+          ROLLBACK WORK.
+          MESSAGE ID '/VWK/EAI_INTERFACES' TYPE 'E' NUMBER '10'
+              WITH l_dl_lines.
+          PERFORM write_error_tab_msg
+                    USING
+                       l_partner
+                       l_dist
+                       l_target_system
+                       '10'
+                       l_dl_lines.
+          COMMIT WORK.
+
+      ENDTRY.
+    ENDIF.
+
+    l_count = 0.
+    CLEAR lt_bupa_dist_lists.
+
+  ENDIF.
+
+ENDLOOP.
+
+FREE lo_bupa_dl_metastructure.
+FREE lt_bupa_dist_lists.
+*&---------------------------------------------------------------------*
+*&      Form  write_error_tab
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM write_error_tab
+    USING
+        partner TYPE bu_partner
+        dist_object
+        target_system TYPE /vwk/eai_system
+        error_text TYPE char255.
+
+  DATA: ls_error TYPE /vwk/eai_bp_il_e,
+        l_timestamp TYPE timestamp.
+
+  ls_error-partner = partner.
+  ls_error-dist_object = dist_object.
+  ls_error-target_system = target_system.
+  ls_error-error_system = sy-sysid.
+
+  GET TIME STAMP FIELD l_timestamp.
+  CONVERT TIME STAMP l_timestamp TIME ZONE sy-zonlo INTO
+      DATE ls_error-error_date
+      TIME ls_error-error_time.
+
+  ls_error-error_text = error_text.
+
+  INSERT /vwk/eai_bp_il_e FROM ls_error.
+ENDFORM.                    " write_error_tab
+*&---------------------------------------------------------------------*
+*&      Form  write_error_tab_msg
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM write_error_tab_msg
+    USING
+        partner TYPE bu_partner
+        dist_object
+        target_system TYPE /vwk/eai_system
+        msgnr TYPE sy-msgno
+        msgv1.
+
+  DATA: error_text TYPE char255,
+        msgv1_c TYPE sy-msgv1.
+
+  MOVE msgv1 TO msgv1_c.
+
+  CALL FUNCTION 'SX_MESSAGE_TEXT_BUILD'
+    EXPORTING
+      msgid                     = '/VWK/EAI_INTERFACES'
+      msgnr                     = msgnr
+      msgv1                     = msgv1_c
+*     MSGV2                     = msgv2
+*     MSGV3                     = msgv3
+*     MSGV4                     = msgv4
+   IMPORTING
+     message_text_output       = error_text.
+
+  PERFORM write_error_tab
+              USING
+                 partner
+                 dist_object
+                 target_system
+                 error_text.
+
+
+ENDFORM.                    " write_error_tab_msg
